@@ -39,6 +39,12 @@ jobs:
           printf "%s\n" "84831b9409646a918e30573bab4c9c91346d8abd" \
             > "$LDIR/android-sdk-preview-license"
 
+      - name: Fix sdkmanager path
+        run: |
+          mkdir -p "$ANDROID_HOME/tools/bin"
+          ln -sf "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "$ANDROID_HOME/tools/bin/sdkmanager"
+
       - name: Build APK
         run: buildozer android debug
         env:
