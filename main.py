@@ -85,24 +85,49 @@ LOGIN_URL = {"quark": "https://pan.quark.cn/", "uc": "https://drive.uc.cn/"}
 LOGIN_ACTIVE = {"pan": None}   # 当前登录提取任务（worker 用它判取消）
 
 
+# p4a 打包后 Activity 类名 = {package.domain}.{package.name}.PythonActivity
+_ACTIVITY_CLASSES = (
+    "com.pandl.app.pandownloader.PythonActivity",   # 本包（buildozer.spec 推出）
+    "org.kivy.android.PythonActivity",              # Kivy Launcher 兼容
+)
+
+
 def _android_activity():
     try:
         from jnius import autoclass
-        return autoclass("org.kivy.android.PythonActivity").mActivity
     except Exception:
         return None
+    for cls in _ACTIVITY_CLASSES:
+        try:
+            act = autoclass(cls).mActivity
+            if act is not None:
+                return act
+        except Exception:
+            continue
+    return None
 
 
 def _webview():
+    act = _android_activity()
+    if act is None:
+        return None
+    # 通道1：实例字段 mWebView（webview bootstrap 的私有字段，JNI 可读）
+    try:
+        wv = act.mWebView
+        if wv is not None:
+            return wv
+    except Exception:
+        pass
+    # 通道2：content view 的第一个子视图（setContentView(mWebView) 的直接孩子）
     try:
         from jnius import autoclass
-        act = autoclass("org.kivy.android.PythonActivity").mActivity
-        if act is None:
-            return None
-        # mWebView 是实例字段（不是静态字段），必须经 mActivity 实例读
-        return act.mWebView
+        rid = autoclass("android.R$id")
+        content = act.findViewById(rid.content)
+        if content is not None and content.getChildCount() > 0:
+            return content.getChildAt(0)
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _run_on_ui_thread(func):
