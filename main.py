@@ -96,31 +96,42 @@ def _android_activity():
 def _webview():
     try:
         from jnius import autoclass
-        return autoclass("org.kivy.android.PythonActivity").mWebView
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        if act is None:
+            return None
+        # mWebView 是实例字段（不是静态字段），必须经 mActivity 实例读
+        return act.mWebView
     except Exception:
         return None
 
 
 def _run_on_ui_thread(func):
     """Java 侧 WebView 调用必须在 UI 线程（loadUrl/goBack 等）"""
-    from jnius import autoclass, PythonJavaClass, java_method
+    try:
+        from jnius import autoclass, PythonJavaClass, java_method
 
-    class _Runnable(PythonJavaClass):
-        __javainterfaces__ = ["java/lang/Runnable"]
-        __javacontext__ = "app"
+        class _Runnable(PythonJavaClass):
+            __javainterfaces__ = ["java/lang/Runnable"]
+            __javacontext__ = "app"
 
-        @java_method("()V")
-        def run(self):
-            func()
+            @java_method("()V")
+            def run(self):
+                try:
+                    func()
+                except Exception as e:
+                    STATE.log(f"WebView 调用失败: {str(e)[:80]}")
 
-    act = _android_activity()
-    if act is not None:
-        act.runOnUiThread(_Runnable())
+        act = _android_activity()
+        if act is not None:
+            act.runOnUiThread(_Runnable())
+    except Exception as e:
+        STATE.log(f"UI线程调度失败: {str(e)[:80]}")
 
 
 def _wv_load(url):
     wv = _webview()
     if wv is None:
+        STATE.log("⚠ 拿不到 WebView 实例，页面跳转失败")
         return
 
     def do():
@@ -838,7 +849,7 @@ max-height:100px;overflow:auto}
 
 <div class="card"><div style="display:flex;justify-content:space-between;align-items:center">
 <label style="margin:0">日志</label>
-<div><a href="/api/log_file" download style="text-decoration:none"><button class=ghost style="padding:2px 12px;font-size:12px;margin-right:6px">下载日志</button></a><button class=ghost style="padding:2px 12px;font-size:12px" onclick="clearLog()">清空</button></div>
+<div><button class=ghost style="padding:2px 12px;font-size:12px;margin-right:6px" onclick="dlLog()">下载日志</button><button class=ghost style="padding:2px 12px;font-size:12px" onclick="clearLog()">清空</button></div>
 </div><div class=log id=log></div></div>
 </div>
 
@@ -909,6 +920,10 @@ $("doneFail").textContent=det;
 $("doneMask").classList.add("show");
 beep();}
 async function clearLog(){await api("clear_logs");$("log").textContent="";}
+async function dlLog(){
+const r=await api("save_log");
+if(r.ok)alert("日志已保存：\n"+r.path+"\n\n用文件管理器打开该文件即可查看或转发");
+else alert("日志保存失败: "+(r.error||"未知错误"));}
 async function autoCk(force){
 const pan=$("panTag").textContent==="夸克网盘"?"quark":"uc";
 // 首选：内置登录窗提取（明文直读，不怕浏览器加密/锁定）
@@ -951,6 +966,24 @@ $("dir").value=c.dir||"";$("cookie").value=c.cookie||""})();
 </script></body></html>"""
 
 
+def build_log_file():
+    """生成日志全文（含系统信息头），返回 (body_bytes, 文件名)"""
+    lines = [
+        "=" * 56,
+        "  网盘直链下载器 v2.2 运行日志 (Android)",
+        "  导出时间: " + time.strftime("%Y-%m-%d %H:%M:%S"),
+        "  系统: " + platform.system() + " " + platform.release()
+        + " (build " + platform.version() + ")",
+        "  Python: " + platform.python_version(),
+        "=" * 56,
+        "",
+    ]
+    with STATE.lock:
+        lines += list(STATE.logs)
+    fname = "下载器日志_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
+    return "\n".join(lines).encode("utf-8"), fname
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -991,21 +1024,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/files"):
             self._json({"files": STATE.files})
         elif self.path.startswith("/api/log_file"):
-            # 日志全文打包下载（含系统/任务信息头，方便发回排查）
-            lines = [
-                "=" * 56,
-                "  网盘直链下载器 v2.2 运行日志",
-                "  导出时间: " + time.strftime("%Y-%m-%d %H:%M:%S"),
-                "  系统: " + platform.system() + " " + platform.release()
-                + " (build " + platform.version() + ")",
-                "  Python: " + platform.python_version(),
-                "=" * 56,
-                "",
-            ]
-            with STATE.lock:
-                lines += list(STATE.logs)
-            body = "\n".join(lines).encode("utf-8")
-            fname = "下载器日志_" + time.strftime("%Y%m%d_%H%M%S") + ".txt"
+            body, fname = build_log_file()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Disposition",
@@ -1064,6 +1083,15 @@ class Handler(BaseHTTPRequestHandler):
             with STATE.lock:
                 STATE.logs = []
             self._json({"ok": True})
+        elif self.path == "/api/save_log":
+            # Android WebView 不支持 a[download]，日志直接写公共下载目录
+            try:
+                body, fname = build_log_file()
+                out = DEFAULT_SAVE_DIR / fname
+                out.write_bytes(body)
+                self._json({"ok": True, "path": str(out)})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)[:120]})
         elif self.path == "/api/login_extract":
             # Android：WebView 导航到网盘登录页，登录后 CookieManager 自动提取
             pan = d.get("pan") or STATE.pan or "quark"
