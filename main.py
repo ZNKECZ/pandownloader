@@ -85,87 +85,9 @@ LOGIN_URL = {"quark": "https://pan.quark.cn/", "uc": "https://drive.uc.cn/"}
 LOGIN_ACTIVE = {"pan": None}   # 当前登录提取任务（worker 用它判取消）
 
 
-# p4a 打包后 Activity 类名 = {package.domain}.{package.name}.PythonActivity
-_ACTIVITY_CLASSES = (
-    "com.pandl.app.pandownloader.PythonActivity",   # 本包（buildozer.spec 推出）
-    "org.kivy.android.PythonActivity",              # Kivy Launcher 兼容
-)
-
-
-def _android_activity():
-    try:
-        from jnius import autoclass
-    except Exception:
-        return None
-    for cls in _ACTIVITY_CLASSES:
-        try:
-            act = autoclass(cls).mActivity
-            if act is not None:
-                return act
-        except Exception:
-            continue
-    return None
-
-
-def _webview():
-    act = _android_activity()
-    if act is None:
-        return None
-    # 通道1：实例字段 mWebView（webview bootstrap 的私有字段，JNI 可读）
-    try:
-        wv = act.mWebView
-        if wv is not None:
-            return wv
-    except Exception:
-        pass
-    # 通道2：content view 的第一个子视图（setContentView(mWebView) 的直接孩子）
-    try:
-        from jnius import autoclass
-        rid = autoclass("android.R$id")
-        content = act.findViewById(rid.content)
-        if content is not None and content.getChildCount() > 0:
-            return content.getChildAt(0)
-    except Exception:
-        pass
-    return None
-
-
-def _run_on_ui_thread(func):
-    """Java 侧 WebView 调用必须在 UI 线程（loadUrl/goBack 等）"""
-    try:
-        from jnius import autoclass, PythonJavaClass, java_method
-
-        class _Runnable(PythonJavaClass):
-            __javainterfaces__ = ["java/lang/Runnable"]
-            __javacontext__ = "app"
-
-            @java_method("()V")
-            def run(self):
-                try:
-                    func()
-                except Exception as e:
-                    STATE.log(f"WebView 调用失败: {str(e)[:80]}")
-
-        act = _android_activity()
-        if act is not None:
-            act.runOnUiThread(_Runnable())
-    except Exception as e:
-        STATE.log(f"UI线程调度失败: {str(e)[:80]}")
-
-
-def _wv_load(url):
-    wv = _webview()
-    if wv is None:
-        STATE.log("⚠ 拿不到 WebView 实例，页面跳转失败")
-        return
-
-    def do():
-        wv.loadUrl(url)
-    _run_on_ui_thread(do)
-
-
-def _wv_cookies(url):
-    """读 WebView CookieManager 里指定 URL 的整串 Cookie（含 httponly）"""
+def _cm_cookies(url):
+    """读 WebView CookieManager 里指定 URL 的整串 Cookie（含 httponly）。
+    CookieManager 是系统级服务，不依赖任何 app 类名，任意线程可调。"""
     try:
         from jnius import autoclass
         cm = autoclass("android.webkit.CookieManager").getInstance()
@@ -174,8 +96,18 @@ def _wv_cookies(url):
         return ""
 
 
+def _app_context():
+    """Application context（ActivityThread.currentApplication 是公开 SDK API）"""
+    try:
+        from jnius import autoclass
+        return autoclass("android.app.ActivityThread").currentApplication()
+    except Exception:
+        return None
+
+
 def _login_extract_worker(pan):
-    """后台线程：每2s读登录页 Cookie，检测到登录态即保存并导航回主页面"""
+    """后台线程：每2s读 CookieManager，检测到登录态即保存，3秒后自动重启生效。
+    页面跳转由前端 location.href 完成（WebView 自己导航），这里只管 Cookie。"""
     url = LOGIN_URL.get(pan, "")
     need = ("__pus=", "__uid=", "__puus=") if pan == "quark" else ()
     for _ in range(180):          # 最多等 6 分钟
@@ -183,7 +115,7 @@ def _login_extract_worker(pan):
         if LOGIN_ACTIVE["pan"] != pan:     # 被新任务取代或已取消
             return
         try:
-            raw = _wv_cookies(url)
+            raw = _cm_cookies(url)
             if not raw:
                 continue
             has_login = any(k in raw for k in need) if need else True
@@ -196,22 +128,21 @@ def _login_extract_worker(pan):
                 save_config(cfg)
                 with STATE.lock:
                     STATE.cookie_ready = cookie
-                STATE.log(f"✓ 检测到登录态，已自动提取 Cookie 并保存")
+                STATE.log("✓ 登录成功！Cookie 已保存，3 秒后自动重启生效...")
                 LOGIN_ACTIVE["pan"] = None
-                _wv_load(f"http://{HOST}:{PORT}/")
-                return
+                time.sleep(3)
+                os._exit(0)   # 重启后 config 带 Cookie，直接可解析下载
         except Exception:
             pass
     LOGIN_ACTIVE["pan"] = None
-    STATE.log("登录等待超时，重新点解析会再次打开登录页")
+    STATE.log("登录等待超时，重新打开 APP 再点解析")
 
 
 def open_login_window(pan):
-    """Android 版：当前 WebView 直接导航到网盘登录页（登录成功自动返回）"""
+    """启动 CookieManager 登录态轮询（页面跳转由前端 location.href 完成）"""
     LOGIN_ACTIVE["pan"] = pan
-    _wv_load(LOGIN_URL.get(pan))
     threading.Thread(target=_login_extract_worker, args=(pan,), daemon=True).start()
-    STATE.log(f"已打开{PAN_PROFILES[pan]['name']}登录页，请登录（登录成功自动返回并继续）")
+    STATE.log(f"已打开{PAN_PROFILES[pan]['name']}登录页，登录成功后 APP 自动重启生效")
 
 
 def _ensure_storage_permission():
@@ -221,15 +152,16 @@ def _ensure_storage_permission():
         env = autoclass("android.os.Environment")
         if env.isExternalStorageManager():
             return
-        act = _android_activity()
-        if act is None:
+        app = _app_context()
+        if app is None:
             return
-        intent = autoclass("android.content.Intent")
+        intent_cls = autoclass("android.content.Intent")
         settings = autoclass("android.provider.Settings")
         uri = autoclass("android.net.Uri")
-        it = intent(settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                    uri.parse("package:" + act.getPackageName()))
-        act.startActivity(it)
+        it = intent_cls(settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        uri.parse("package:" + app.getPackageName()))
+        it.addFlags(intent_cls.FLAG_ACTIVITY_NEW_TASK)  # 非 Activity context 启动必须
+        app.startActivity(it)
     except Exception:
         pass
 
@@ -842,7 +774,7 @@ max-height:100px;overflow:auto}
 <div class=cookie-warn id=ckWarn></div>
 <div class=cookie-warn id=ckBad style="color:#dc2626"></div>
 </details>
-<div id=loginTip style="display:none;margin-top:6px;font-size:13px;color:#b45309">⚠ 夸克网盘需要登录：已打开登录页，登录后自动返回继续</div>
+<div id=loginTip style="display:none;margin-top:6px;font-size:13px;color:#b45309">⚠ 夸克网盘需要登录：即将自动打开登录页，登录成功后 APP 自动重启生效</div>
 </div>
 
 <div class="card">
@@ -893,7 +825,7 @@ async function api(path,body){
 const r=await fetch("/api/"+path,{method:"POST",headers:{"Content-Type":"application/json"},
 body:JSON.stringify(body||{})});return r.json()}
 async function doParse(){
-if(!$("url").value.trim()){alert("先粘贴链接");return}
+if(!$("url").value.trim()){$("stat").textContent="先粘贴分享链接";return}
 $("stat").textContent="解析中…";
 const r=await api("parse",{url:$("url").value,pwd:$("pwd").value,cookie:$("cookie").value,dir:$("dir").value});
 if(r.error)$("stat").textContent="失败: "+r.error;}
@@ -905,7 +837,7 @@ async function dl(all){
 let fids=[];
 if(all){fids="__ALL__"}else{
 fids=[...document.querySelectorAll(".ck:checked")].map(x=>x.value);
-if(!fids.length){alert("先勾选文件");return}}
+if(!fids.length){$("stat").textContent="先勾选文件再点下载";return}}
 await api("download",{fids:fids,dir:$("dir").value,cookie:$("cookie").value,threads:+$("threads").value})}
 async function cancel(){await api("cancel")}
 function setPan(p){
@@ -945,10 +877,7 @@ $("doneFail").textContent=det;
 $("doneMask").classList.add("show");
 beep();}
 async function clearLog(){await api("clear_logs");$("log").textContent="";}
-async function dlLog(){
-const r=await api("save_log");
-if(r.ok)alert("日志已保存：\n"+r.path+"\n\n用文件管理器打开该文件即可查看或转发");
-else alert("日志保存失败: "+(r.error||"未知错误"));}
+async function dlLog(){await api("save_log")}  // 结果直接打进日志区（alert在p4a壳里被系统吞掉）
 async function autoCk(force){
 const pan=$("panTag").textContent==="夸克网盘"?"quark":"uc";
 // 首选：内置登录窗提取（明文直读，不怕浏览器加密/锁定）
@@ -963,14 +892,18 @@ $("prog").textContent=s.current?`${s.current}  ${fmt(s.done)}/${fmt(s.total)}  $
 if(s.status==="downloading")wasDownloading=true;
 if(wasDownloading&&s.status==="idle"){wasDownloading=false;showDone(s.finished,s.transferred||[],s.failed||[]);}
 if(s.pan)setPan(s.pan);
-// 后端判定需要登录（夸克无登录态/Cookie失效）→ 自动弹登录窗
+// 后端判定需要登录（夸克无登录态/Cookie失效）→ 启动Cookie轮询后 WebView 自己跳登录页
 if(s.need_login&&!loginAsking){
 loginAsking=true;
 $("loginTip").style.display="block";
 api("login_extract",{pan:s.need_login}).then(r=>{
-if(!r.ok){loginAsking=false;$("loginTip").style.display="none";
-alert(r.error||"登录窗打开失败");}});
-}
+if(r.ok){
+// WebView 自导航（JS 触发，不依赖后端拿 WebView 引用）
+setTimeout(()=>{window.location.href=(s.need_login==="uc"?"https://drive.uc.cn/":"https://pan.quark.cn/")},1200);
+}else{
+loginAsking=false;$("loginTip").style.display="none";
+$("stat").textContent="登录页打开失败: "+(r.error||"");
+}});}
 if(s.cookie_ready){
 $("cookie").value=s.cookie_ready;
 loginAsking=false;
@@ -1109,13 +1042,16 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.logs = []
             self._json({"ok": True})
         elif self.path == "/api/save_log":
-            # Android WebView 不支持 a[download]，日志直接写公共下载目录
+            # Android WebView 不支持 a[download]，日志直接写公共下载目录；
+            # 结果打进日志区（p4a 壳里 alert 被系统吞掉，用户看不到弹窗）
             try:
                 body, fname = build_log_file()
                 out = DEFAULT_SAVE_DIR / fname
                 out.write_bytes(body)
+                STATE.log("✓ 日志已导出: " + str(out))
                 self._json({"ok": True, "path": str(out)})
             except Exception as e:
+                STATE.log("✗ 日志导出失败: " + str(e)[:100])
                 self._json({"ok": False, "error": str(e)[:120]})
         elif self.path == "/api/login_extract":
             # Android：WebView 导航到网盘登录页，登录后 CookieManager 自动提取
