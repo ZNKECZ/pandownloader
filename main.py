@@ -81,7 +81,9 @@ PAN_PROFILES = {
 # ============================================================
 PAN_COOKIE_DOMAIN = {"quark": "quark.cn", "uc": "uc.cn"}
 _COOKIE_BAD = re.compile(r"[^\x21-\x7e]")  # Cookie 值只允许可见 ASCII
-LOGIN_URL = {"quark": "https://pan.quark.cn/", "uc": "https://drive.uc.cn/"}
+# pan.quark.cn 对移动端 UA 只给 APP 推广页；quark.cn 网页版移动端有完整登录入口
+# （手机验证码/账号密码/扫码/第三方），Cookie 写 .quark.cn 根域，pan.quark.cn 共享
+LOGIN_URL = {"quark": "https://quark.cn/", "uc": "https://drive.uc.cn/"}
 LOGIN_ACTIVE = {"pan": None}   # 当前登录提取任务（worker 用它判取消）
 
 
@@ -106,20 +108,24 @@ def _app_context():
 
 
 def _login_extract_worker(pan):
-    """后台线程：每2s读 CookieManager，检测到登录态即保存，3秒后自动重启生效。
+    """后台线程：每2s读 CookieManager（多 URL 轮询），检测到登录态即保存。
+    跳回主页面优先用静态 PythonActivity.loadUrl（社区验证可直调），失败重启兜底。
     页面跳转由前端 location.href 完成（WebView 自己导航），这里只管 Cookie。"""
-    url = LOGIN_URL.get(pan, "")
+    urls = (["https://pan.quark.cn/", "https://quark.cn/"] if pan == "quark"
+            else [LOGIN_URL.get(pan, "")])
     need = ("__pus=", "__uid=", "__puus=") if pan == "quark" else ()
     for _ in range(180):          # 最多等 6 分钟
         time.sleep(2)
         if LOGIN_ACTIVE["pan"] != pan:     # 被新任务取代或已取消
             return
-        try:
-            raw = _cm_cookies(url)
-            if not raw:
-                continue
-            has_login = any(k in raw for k in need) if need else True
-            if has_login:
+        for url in urls:
+            try:
+                raw = _cm_cookies(url)
+                if not raw:
+                    continue
+                has_login = any(k in raw for k in need) if need else True
+                if not has_login:
+                    continue
                 # 防御性清洗：丢含非可见 ASCII 的脏条目
                 cookie = "; ".join(p.strip() for p in raw.split(";")
                                    if p.strip() and not _COOKIE_BAD.search(p.strip()))
@@ -128,12 +134,20 @@ def _login_extract_worker(pan):
                 save_config(cfg)
                 with STATE.lock:
                     STATE.cookie_ready = cookie
-                STATE.log("✓ 登录成功！Cookie 已保存，3 秒后自动重启生效...")
+                STATE.log("✓ 登录成功！Cookie 已保存，正在返回下载器...")
                 LOGIN_ACTIVE["pan"] = None
-                time.sleep(3)
-                os._exit(0)   # 重启后 config 带 Cookie，直接可解析下载
-        except Exception:
-            pass
+                # 社区项目验证：静态 PythonActivity.loadUrl 可从 Python 直调
+                try:
+                    from jnius import autoclass
+                    autoclass("org.kivy.android.PythonActivity").loadUrl(
+                        f"http://{HOST}:{PORT}/")
+                    return
+                except Exception as e:
+                    STATE.log(f"直接返回失败({str(e)[:60]})，3 秒后自动重启生效...")
+                    time.sleep(3)
+                    os._exit(0)   # 重启后 config 带 Cookie，直接可解析下载
+            except Exception:
+                continue
     LOGIN_ACTIVE["pan"] = None
     STATE.log("登录等待超时，重新打开 APP 再点解析")
 
@@ -774,7 +788,7 @@ max-height:100px;overflow:auto}
 <div class=cookie-warn id=ckWarn></div>
 <div class=cookie-warn id=ckBad style="color:#dc2626"></div>
 </details>
-<div id=loginTip style="display:none;margin-top:6px;font-size:13px;color:#b45309">⚠ 夸克网盘需要登录：即将自动打开登录页，登录成功后 APP 自动重启生效</div>
+<div id=loginTip style="display:none;margin-top:6px;font-size:13px;color:#b45309">⚠ 夸克网盘需要登录：即将打开夸克登录页，登录成功后自动返回继续解析</div>
 </div>
 
 <div class="card">
@@ -898,8 +912,11 @@ loginAsking=true;
 $("loginTip").style.display="block";
 api("login_extract",{pan:s.need_login}).then(r=>{
 if(r.ok){
+// 跳转前暂存链接（登录跳回后自动恢复解析）
+api("save_pending",{url:$("url").value,pwd:$("pwd").value}).then(()=>{
 // WebView 自导航（JS 触发，不依赖后端拿 WebView 引用）
-setTimeout(()=>{window.location.href=(s.need_login==="uc"?"https://drive.uc.cn/":"https://pan.quark.cn/")},1200);
+setTimeout(()=>{window.location.href=(s.need_login==="uc"?"https://drive.uc.cn/":"https://quark.cn/")},800);
+});
 }else{
 loginAsking=false;$("loginTip").style.display="none";
 $("stat").textContent="登录页打开失败: "+(r.error||"");
@@ -920,7 +937,13 @@ $("log").textContent=s.logs.join("\n");$("log").scrollTop=1e9;
 }catch(e){}}
 setInterval(tick,800);
 (async()=>{const c=await(await fetch("/api/config")).json();
-$("dir").value=c.dir||"";$("cookie").value=c.cookie||""})();
+$("dir").value=c.dir||"";$("cookie").value=c.cookie||"";
+// 登录跳回后自动恢复：有暂存链接且有 Cookie → 自动填入并重新解析
+if(c.pending_url&&c.cookie){
+$("url").value=c.pending_url;$("pwd").value=c.pending_pwd||"";
+await api("clear_pending");
+doParse();
+}})();
 </script></body></html>"""
 
 
@@ -1061,6 +1084,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "msg": "已打开登录页，登录成功后自动返回"})
             except Exception as e:
                 self._json({"ok": False, "error": f"登录页打开失败: {str(e)[:80]}"})
+        elif self.path == "/api/save_pending":
+            # 跳登录页前暂存链接（页面重载后自动恢复解析）
+            cfg = load_config()
+            cfg["pending_url"] = d.get("url", "")
+            cfg["pending_pwd"] = d.get("pwd", "")
+            save_config(cfg)
+            self._json({"ok": True})
+        elif self.path == "/api/clear_pending":
+            cfg = load_config()
+            cfg.pop("pending_url", None)
+            cfg.pop("pending_pwd", None)
+            save_config(cfg)
+            self._json({"ok": True})
         else:
             self._json({"error": "not found"}, 404)
 
