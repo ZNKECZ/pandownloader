@@ -107,56 +107,108 @@ def _app_context():
         return None
 
 
-def _login_extract_worker(pan):
-    """后台线程：每2s读 CookieManager（多 URL 轮询），检测到登录态即保存。
-    跳回主页面优先用静态 PythonActivity.loadUrl（社区验证可直调），失败重启兜底。
-    页面跳转由前端 location.href 完成（WebView 自己导航），这里只管 Cookie。"""
-    urls = (["https://pan.quark.cn/", "https://quark.cn/"] if pan == "quark"
-            else [LOGIN_URL.get(pan, "")])
-    need = ("__pus=", "__uid=", "__puus=") if pan == "quark" else ()
-    for _ in range(180):          # 最多等 6 分钟
+# ---------------- 夸克扫码登录（纯 API，社区逆向端点，零 WebView/UA 依赖） ----------------
+QR_PC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+}
+
+
+def _http_json(url, params=None, cj=None, timeout=30):
+    """GET JSON（带 PC UA）；cj 传入时收集响应 Set-Cookie"""
+    full = url + ("?" + urllib.parse.urlencode(params) if params else "")
+    req = urllib.request.Request(full, headers=QR_PC_HEADERS)
+    if cj is not None:
+        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        with op.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "ignore"))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "ignore"))
+
+
+def qr_get_token():
+    """① 拿扫码 token（社区逆向端点）"""
+    import uuid
+    d = _http_json("https://uop.quark.cn/cas/ajax/getTokenForQrcodeLogin",
+                   {"client_id": "532", "v": "1.2", "request_id": str(uuid.uuid4())})
+    if d.get("status") == 2000000:
+        token = d.get("data", {}).get("members", {}).get("token")
+        if token:
+            return token
+    raise RuntimeError(f"获取二维码token失败: {d.get('message', d)}")
+
+
+def qr_build_url(token):
+    """② 拼扫码登录短链（即二维码内容；夸克APP内打开会直接弹"确认登录"）"""
+    q = urllib.parse.urlencode({
+        "token": token, "client_id": "532", "ssb": "weblogin",
+        "uc_param_str": "",
+        "uc_biz_str": "S:custom|OPT:SAREA@0|OPT:IMMERSIVE@1|OPT:BACK_BTN_STYLE@0"})
+    return f"https://su.quark.cn/4_eMHBJ?{q}"
+
+
+def qr_poll_worker(token):
+    """③ 轮询扫码状态；用户确认后 ④ account/info 收 Set-Cookie 落全套登录态"""
+    import uuid
+    for _ in range(150):           # 2s × 150 = 5 分钟
         time.sleep(2)
-        if LOGIN_ACTIVE["pan"] != pan:     # 被新任务取代或已取消
+        if LOGIN_ACTIVE["pan"] != "quark":    # 用户取消
             return
-        for url in urls:
-            try:
-                raw = _cm_cookies(url)
-                if not raw:
-                    continue
-                has_login = any(k in raw for k in need) if need else True
-                if not has_login:
-                    continue
-                # 防御性清洗：丢含非可见 ASCII 的脏条目
-                cookie = "; ".join(p.strip() for p in raw.split(";")
-                                   if p.strip() and not _COOKIE_BAD.search(p.strip()))
+        try:
+            d = _http_json(
+                "https://uop.quark.cn/cas/ajax/getServiceTicketByQrcodeToken",
+                {"client_id": "532", "v": "1.2", "token": token,
+                 "request_id": str(uuid.uuid4())})
+            st = d.get("status")
+            if st == 2000000 and d.get("data", {}).get("members", {}).get("service_ticket"):
+                ticket = d["data"]["members"]["service_ticket"]
+                cj = http.cookiejar.CookieJar()
+                _http_json("https://pan.quark.cn/account/info",
+                           {"st": ticket, "lw": "scan"}, cj=cj)
+                pairs = {}
+                for c in cj:
+                    if "quark.cn" in (c.domain or ""):
+                        pairs[c.name] = c.value
+                if not any(k in pairs for k in ("__pus", "__uid", "__puus")):
+                    STATE.log("✗ 登录态字段缺失，请重新扫码")
+                    LOGIN_ACTIVE["pan"] = None
+                    return
+                cookie = "; ".join(f"{k}={v}" for k, v in pairs.items()
+                                   if not _COOKIE_BAD.search(str(v)))
                 cfg = load_config()
                 cfg["cookie"] = cookie
                 save_config(cfg)
                 with STATE.lock:
                     STATE.cookie_ready = cookie
-                STATE.log("✓ 登录成功！Cookie 已保存，正在返回下载器...")
+                STATE.log(f"✓ 扫码登录成功！Cookie 已保存（{len(pairs)} 条），自动继续解析")
                 LOGIN_ACTIVE["pan"] = None
-                # 社区项目验证：静态 PythonActivity.loadUrl 可从 Python 直调
-                try:
-                    from jnius import autoclass
-                    autoclass("org.kivy.android.PythonActivity").loadUrl(
-                        f"http://{HOST}:{PORT}/")
-                    return
-                except Exception as e:
-                    STATE.log(f"直接返回失败({str(e)[:60]})，3 秒后自动重启生效...")
-                    time.sleep(3)
-                    os._exit(0)   # 重启后 config 带 Cookie，直接可解析下载
-            except Exception:
-                continue
+                return
+            if st in (50004002, 50004003, 50004004):   # 明确失败/过期
+                STATE.log("✗ 二维码已过期或被拒绝，请重新获取")
+                LOGIN_ACTIVE["pan"] = None
+                return
+            # 50004001 = 等待扫码，继续轮询
+        except Exception:
+            pass
+    STATE.log("扫码等待超时，请重新获取二维码")
     LOGIN_ACTIVE["pan"] = None
-    STATE.log("登录等待超时，重新打开 APP 再点解析")
 
 
-def open_login_window(pan):
-    """启动 CookieManager 登录态轮询（页面跳转由前端 location.href 完成）"""
-    LOGIN_ACTIVE["pan"] = pan
-    threading.Thread(target=_login_extract_worker, args=(pan,), daemon=True).start()
-    STATE.log(f"已打开{PAN_PROFILES[pan]['name']}登录页，登录成功后 APP 自动重启生效")
+def qr_login_start():
+    """启动扫码登录：拿 token + 生成二维码链接 + 后台轮询。返回二维码内容 URL"""
+    token = qr_get_token()
+    qr_url = qr_build_url(token)
+    LOGIN_ACTIVE["pan"] = "quark"
+    threading.Thread(target=qr_poll_worker, args=(token,), daemon=True).start()
+    STATE.log("二维码已生成：夸克APP扫码确认，或APP内打开链接直接登录")
+    return qr_url
+
+
+def qr_login_cancel():
+    LOGIN_ACTIVE["pan"] = None
 
 
 def _ensure_storage_permission():
@@ -788,7 +840,7 @@ max-height:100px;overflow:auto}
 <div class=cookie-warn id=ckWarn></div>
 <div class=cookie-warn id=ckBad style="color:#dc2626"></div>
 </details>
-<div id=loginTip style="display:none;margin-top:6px;font-size:13px;color:#b45309">⚠ 夸克网盘需要登录：即将打开夸克登录页，登录成功后自动返回继续解析</div>
+<div id=loginTip style="display:none;margin-top:6px;font-size:13px;color:#b45309">⚠ 夸克网盘需要登录：已弹出二维码，用夸克APP扫码或打开链接确认</div>
 </div>
 
 <div class="card">
@@ -830,6 +882,20 @@ max-height:100px;overflow:auto}
 <div class=done-sub id=doneSub></div>
 <div class=done-fail id=doneFail></div>
 <button onclick="$('doneMask').classList.remove('show')">知道了</button>
+</div></div>
+
+<div class=mask id=qrMask><div class=done-card style="padding:20px 24px">
+<div class=done-title style="font-size:17px">夸克扫码登录</div>
+<img id=qrImg style="width:240px;height:240px;background:#fff;border-radius:8px;margin:12px 0" onerror="this.style.display='none'">
+<div class=done-sub id=qrHint style="font-size:13px;line-height:1.8;text-align:left">
+<b>方式一（推荐）</b>：截屏二维码 → 打开夸克APP → 我的 → 扫一扫 → 右上角相册选截图 → 确认登录<br>
+<b>方式二</b>：点下方"复制链接"→ 粘贴到夸克APP搜索框打开 → 直接确认登录
+</div>
+<div style="display:flex;gap:6px;margin-top:10px;align-items:center">
+<input type=text id=qrLink readonly style="flex:1;font-size:10px;padding:6px;border:1px solid var(--line);border-radius:6px" onclick="this.select()">
+<button style="padding:6px 14px;font-size:13px" onclick="copyQr()">复制链接</button>
+</div>
+<button class=ghost style="margin-top:10px" onclick="closeQr()">取消登录</button>
 </div></div>
 <script>
 const $=id=>document.getElementById(id);
@@ -892,12 +958,26 @@ $("doneMask").classList.add("show");
 beep();}
 async function clearLog(){await api("clear_logs");$("log").textContent="";}
 async function dlLog(){await api("save_log")}  // 结果直接打进日志区（alert在p4a壳里被系统吞掉）
+function copyQr(){
+const el=$("qrLink");el.select();
+try{document.execCommand("copy")}catch(e){}
+if(navigator.clipboard)navigator.clipboard.writeText(el.value).catch(()=>{});
+el.style.background="#dcfce7";setTimeout(()=>el.style.background="",800);}
+async function closeQr(){
+await api("qr_cancel");
+$("qrMask").classList.remove("show");
+loginAsking=false;$("loginTip").style.display="none";
+$("stat").textContent="已取消登录，重新点解析可再次获取二维码";}
 async function autoCk(force){
-const pan=$("panTag").textContent==="夸克网盘"?"quark":"uc";
-// 首选：内置登录窗提取（明文直读，不怕浏览器加密/锁定）
-const r=await api("login_extract",{pan:pan});
-if(r.ok){alert("登录窗口已打开\n\n1. 在弹出窗口里登录"+$("panTag").textContent()+"（扫码/账号均可）\n2. 登录成功后窗口自动关闭，Cookie 自动填入\n3. 然后直接点下载即可");return;}
-alert(r.error||"登录窗打开失败，请手动粘贴 Cookie");}
+// 隐藏区备用入口：与自动流程同款扫码登录
+const r=await api("login_extract",{pan:"quark"});
+if(r.ok&&r.qr_url){
+$("qrLink").value=r.qr_url;
+$("qrImg").style.display="";
+$("qrImg").src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data="+encodeURIComponent(r.qr_url);
+$("qrMask").classList.add("show");loginAsking=true;
+$("loginTip").style.display="block";}
+else $("stat").textContent="二维码获取失败: "+(r.error||"");}
 let loginAsking=false;   // 登录窗已弹出标志（防重入）
 async function tick(){
 try{const s=await (await fetch("/api/progress")).json();
@@ -906,25 +986,25 @@ $("prog").textContent=s.current?`${s.current}  ${fmt(s.done)}/${fmt(s.total)}  $
 if(s.status==="downloading")wasDownloading=true;
 if(wasDownloading&&s.status==="idle"){wasDownloading=false;showDone(s.finished,s.transferred||[],s.failed||[]);}
 if(s.pan)setPan(s.pan);
-// 后端判定需要登录（夸克无登录态/Cookie失效）→ 启动Cookie轮询后 WebView 自己跳登录页
+// 后端判定需要登录（夸克无登录态/Cookie失效）→ 获取二维码弹层（纯API不跳页）
 if(s.need_login&&!loginAsking){
 loginAsking=true;
 $("loginTip").style.display="block";
 api("login_extract",{pan:s.need_login}).then(r=>{
-if(r.ok){
-// 跳转前暂存链接（登录跳回后自动恢复解析）
-api("save_pending",{url:$("url").value,pwd:$("pwd").value}).then(()=>{
-// WebView 自导航（JS 触发，不依赖后端拿 WebView 引用）
-setTimeout(()=>{window.location.href=(s.need_login==="uc"?"https://drive.uc.cn/":"https://quark.cn/")},800);
-});
+if(r.ok&&r.qr_url){
+$("qrLink").value=r.qr_url;
+$("qrImg").style.display="";
+$("qrImg").src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data="+encodeURIComponent(r.qr_url);
+$("qrMask").classList.add("show");
 }else{
 loginAsking=false;$("loginTip").style.display="none";
-$("stat").textContent="登录页打开失败: "+(r.error||"");
+$("stat").textContent="二维码获取失败: "+(r.error||"");
 }});}
 if(s.cookie_ready){
 $("cookie").value=s.cookie_ready;
 loginAsking=false;
 $("loginTip").style.display="none";
+$("qrMask").classList.remove("show");
 // 登录成功 → 自动重新解析当前链接
 if($("url").value.trim())doParse();
 }
@@ -1077,13 +1157,15 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.log("✗ 日志导出失败: " + str(e)[:100])
                 self._json({"ok": False, "error": str(e)[:120]})
         elif self.path == "/api/login_extract":
-            # Android：WebView 导航到网盘登录页，登录后 CookieManager 自动提取
-            pan = d.get("pan") or STATE.pan or "quark"
+            # 夸克扫码登录：生成二维码短链 + 后台轮询（纯API，无需跳网页）
             try:
-                open_login_window(pan)
-                self._json({"ok": True, "msg": "已打开登录页，登录成功后自动返回"})
+                qr_url = qr_login_start()
+                self._json({"ok": True, "qr_url": qr_url})
             except Exception as e:
-                self._json({"ok": False, "error": f"登录页打开失败: {str(e)[:80]}"})
+                self._json({"ok": False, "error": f"二维码获取失败: {str(e)[:80]}"})
+        elif self.path == "/api/qr_cancel":
+            qr_login_cancel()
+            self._json({"ok": True})
         elif self.path == "/api/save_pending":
             # 跳登录页前暂存链接（页面重载后自动恢复解析）
             cfg = load_config()
