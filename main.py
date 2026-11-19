@@ -17,6 +17,22 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+
+# ---------------- Android SSL 证书修复（p4a 打包的 Python 找不到系统 CA） ----------------
+_SSL_CTX = None
+
+
+def _ssl_ctx():
+    """全局 HTTPS 证书上下文：优先 certifi（Mozilla CA 包），回退系统默认。"""
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        try:
+            import certifi
+            _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            _SSL_CTX = ssl.create_default_context()
+    return _SSL_CTX
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -122,10 +138,13 @@ def _http_json(url, params=None, cj=None, timeout=30):
     full = url + ("?" + urllib.parse.urlencode(params) if params else "")
     req = urllib.request.Request(full, headers=QR_PC_HEADERS)
     if cj is not None:
-        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        op = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj),
+            urllib.request.HTTPSHandler(context=_ssl_ctx()))
         with op.open(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", "ignore"))
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout,
+                                context=_ssl_ctx()) as r:
         return json.loads(r.read().decode("utf-8", "ignore"))
 
 
@@ -246,7 +265,7 @@ class PanAPI:
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.cj))
         self.opener.add_handler(urllib.request.HTTPSHandler(
-            context=ssl.create_default_context()))
+            context=_ssl_ctx()))
 
     def warmup(self):
         url = self.prof["share_page"].format(pid=self.pwd_id or "")
@@ -496,7 +515,8 @@ class PanAPI:
 
         def worker():
             # 每线程独立 opener：连接互不复用，规避服务端按会话限速
-            op = urllib.request.build_opener()
+            op = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=_ssl_ctx()))
             while True:
                 if cancel and cancel.is_set():
                     return
@@ -674,7 +694,7 @@ def parse_worker(text, passcode, cookie):
         STATE.log(f"识别为【{pname}】分享 ID: {pwd_id}  提取码: {pc or '(无)'}")
         # 夸克全程要登录态（解析+下载都走鉴权 API），无登录态直接弹登录窗
         if pan == "quark" and not _has_login_cookie(cookie):
-            STATE.log("⚠ 夸克网盘需要登录，已自动打开登录页（登录后自动返回继续解析）")
+            STATE.log("⚠ 夸克网盘需要登录，已弹出二维码（夸克APP扫码或打开链接确认）")
             with STATE.lock:
                 STATE.need_login = "quark"
             return
@@ -693,7 +713,7 @@ def parse_worker(text, passcode, cookie):
         STATE.log(f"解析失败: {msg}")
         # 鉴权类失败（400/401/403）且是夸克：Cookie 失效，重新弹登录
         if STATE.pan == "quark" and any(c in msg for c in ("400", "401", "403")):
-            STATE.log("⚠ 登录态已失效，已自动打开登录页，请重新登录")
+            STATE.log("⚠ 登录态已失效，已弹出二维码，请重新扫码登录")
             with STATE.lock:
                 STATE.need_login = "quark"
     finally:
@@ -710,7 +730,7 @@ def download_worker(fids, save_dir, cookie, nthread=32):
     root.mkdir(parents=True, exist_ok=True)
     # 夸克无登录态不白跑：弹登录窗，登录后用户再点下载
     if STATE.pan == "quark" and not _has_login_cookie(cookie):
-        STATE.log("⚠ 夸克下载需要登录，已自动打开登录页（登录成功后再点下载）")
+        STATE.log("⚠ 夸克下载需要登录，已弹出二维码（确认后再点下载）")
         with STATE.lock:
             STATE.need_login = "quark"
         STATE.status = "idle"
