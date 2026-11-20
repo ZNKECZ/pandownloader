@@ -134,9 +134,13 @@ QR_PC_HEADERS = {
 
 
 def _http_json(url, params=None, cj=None, timeout=30):
-    """GET JSON（带 PC UA）；cj 传入时收集响应 Set-Cookie"""
+    """GET JSON；cj 传入时收集响应 Set-Cookie。
+    UA 与 PanAPI 保持同一夸克客户端 UA——同一 Cookie 跨 UA 环境使用会触发风控 412"""
+    ua = PAN_PROFILES["quark"]["ua"]
+    headers = {"User-Agent": ua, "Accept": "application/json, text/plain, */*",
+               "Accept-Language": "zh-CN,zh;q=0.9"}
     full = url + ("?" + urllib.parse.urlencode(params) if params else "")
-    req = urllib.request.Request(full, headers=QR_PC_HEADERS)
+    req = urllib.request.Request(full, headers=headers)
     if cj is not None:
         op = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(cj),
@@ -187,6 +191,21 @@ def qr_poll_worker(token):
                 cj = http.cookiejar.CookieJar()
                 _http_json("https://pan.quark.cn/account/info",
                            {"st": ticket, "lw": "scan"}, cj=cj)
+                # 补种全量 Cookie：account/info 只落核心登录态，
+                # 风控字段要再访问网盘首页/配置接口才会种全（缺字段会 412）
+                op = urllib.request.build_opener(
+                    urllib.request.HTTPCookieProcessor(cj),
+                    urllib.request.HTTPSHandler(context=_ssl_ctx()))
+                for seed_url in ("https://pan.quark.cn/",
+                                 "https://drive.quark.cn/1/clouddrive/config"
+                                 "?pr=ucpro&fr=pc"):
+                    try:
+                        req = urllib.request.Request(
+                            seed_url,
+                            headers={"User-Agent": PAN_PROFILES["quark"]["ua"]})
+                        op.open(req, timeout=15).read()
+                    except Exception:
+                        pass
                 pairs = {}
                 for c in cj:
                     if "quark.cn" in (c.domain or ""):
@@ -469,6 +488,9 @@ class PanAPI:
                       nthread=32):
         import queue
         headers = self._headers()
+        # 下载 CDN 节点不需要跨域头，带 Origin 反而触发风控预检（412）
+        headers.pop("Origin", None)
+        headers["Accept"] = "*/*"
         # 安全软件（电脑管家/Defender）会隔离写入中的 APK/EXE，
         # 先用 .dat 中性扩展名落盘，下完再改名
         real_path = save_path
@@ -477,9 +499,18 @@ class PanAPI:
 
         # 1) 探测总大小（Range 0-0 拿 Content-Range）
         req = urllib.request.Request(url, headers={**headers, "Range": "bytes=0-0"})
-        with self.opener.open(req, timeout=30) as resp:
-            cr = resp.headers.get("Content-Range", "")
-            total = int(cr.split("/")[-1]) if "/" in cr else 0
+        try:
+            with self.opener.open(req, timeout=30) as resp:
+                cr = resp.headers.get("Content-Range", "")
+                total = int(cr.split("/")[-1]) if "/" in cr else 0
+        except urllib.error.HTTPError as e:
+            # 透传服务端错误正文（412 风控原因在响应体里）
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "ignore")[:200]
+            except Exception:
+                pass
+            raise RuntimeError(f"HTTP {e.code} {body}".strip())
         if total <= 0:
             raise RuntimeError("无法获取文件大小")
 
