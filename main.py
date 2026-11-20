@@ -262,10 +262,11 @@ class PanAPI:
         self.base = self.prof["hosts"][0]
         # API 要求先访问分享页拿会话 cookie（否则 403）
         self.cj = http.cookiejar.CookieJar()
+        # 带证书的 HTTPSHandler 必须作为 build_opener 参数传入（顶掉默认无证书
+        # handler）；build 后再 add_handler 永远排在默认 handler 后面不生效
         self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.cj))
-        self.opener.add_handler(urllib.request.HTTPSHandler(
-            context=_ssl_ctx()))
+            urllib.request.HTTPCookieProcessor(self.cj),
+            urllib.request.HTTPSHandler(context=_ssl_ctx()))
 
     def warmup(self):
         url = self.prof["share_page"].format(pid=self.pwd_id or "")
