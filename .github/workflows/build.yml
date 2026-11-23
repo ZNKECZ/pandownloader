@@ -4,6 +4,10 @@ on:
   push:
   workflow_dispatch:
 
+# 自动发 Release 需要写权限
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -38,6 +42,10 @@ jobs:
             > "$LDIR/android-sdk-license"
           printf "%s\n" "84831b9409646a918e30573bab4c9c91346d8abd" \
             > "$LDIR/android-sdk-preview-license"
+          printf "%s\n" "33b6a2b64607f11b759f320ef9dff4ae5c47d97a" \
+            > "$LDIR/google-gdk-license"
+          printf "%s\n" "859f317696f67ef3d7f30a50a5560e7834b43903" \
+            > "$LDIR/android-sdk-arm-dbt-license"
 
       - name: Fix sdkmanager path
         run: |
@@ -55,3 +63,11 @@ jobs:
         with:
           name: pandownloader-apk
           path: bin/*.apk
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.2.${{ github.run_number }}
+          name: 网盘下载器 v2.2.${{ github.run_number }}
+          files: bin/*.apk
+          generate_release_notes: true
